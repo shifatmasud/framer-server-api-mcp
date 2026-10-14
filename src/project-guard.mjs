@@ -1,18 +1,13 @@
 const PROJECT_ROUTE = /^\/mcp\/projects\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)--([A-Za-z0-9]{8,64})$/;
 const MAX_BEARER_LENGTH = 4096;
-const BEARER_VALUE = /^[A-Za-z0-9._~+/-]+=*$/;
+const BEARER_VALUE = /^[A-Za-z0-9._~+\/-]+=*$/;
 export const MCP_PROTOCOL_VERSION = "2025-03-26";
-
-function isWellFormedProtocolVersion(version) {
-  if (typeof version !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(version)) return false;
-  const year = Number(version.slice(0, 4));
-  const month = Number(version.slice(5, 7));
-  const day = Number(version.slice(8, 10));
-  if (year < 1 || month < 1 || month > 12) return false;
-  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
-  return day >= 1 && day <= daysInMonth;
-}
+export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+]);
 
 // The runtime uses an explicit trusted host allowlist.
 // Reject every unlisted host.
@@ -32,6 +27,7 @@ export function parsePinnedProjectRoute(requestUrl) {
   }
 
   if (url.search || url.hash || url.username || url.password) return null;
+
   const match = PROJECT_ROUTE.exec(url.pathname);
   if (!match) return null;
 
@@ -49,7 +45,7 @@ export function parseBearerHeader(headerValue) {
   if (typeof headerValue !== "string" || headerValue.length > MAX_BEARER_LENGTH + 7) {
     return null;
   }
-  const match = /^Bearer ([A-Za-z0-9._~+/-]+=*)$/i.exec(headerValue);
+  const match = /^Bearer ([A-Za-z0-9._~+\/-]+=*)$/i.exec(headerValue);
   if (!match || match[1].length > MAX_BEARER_LENGTH || !BEARER_VALUE.test(match[1])) {
     return null;
   }
@@ -159,7 +155,7 @@ function failure(status, code) {
   });
 }
 
-function normalizeInitializeRequest(request, payload) {
+function normalizeLegacyInitializeRequest(request, payload) {
   const message = Array.isArray(payload) ? payload[0] : payload;
   const normalizedMessage = {
     ...message,
@@ -171,7 +167,6 @@ function normalizeInitializeRequest(request, payload) {
   headers.delete("content-length");
   headers.delete("content-encoding");
   headers.delete("transfer-encoding");
-  headers.delete("mcp-protocol-version");
   return new Request(request.url, {
     method: "POST",
     headers,
@@ -200,20 +195,20 @@ async function validateProtocol(request) {
       return { error: failure(400, "invalid_mcp_request"), request };
     }
     const requestedVersion = initializeMessages[0].params?.protocolVersion;
-    if (!isWellFormedProtocolVersion(requestedVersion)) {
+    if (!SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion)) {
       return { error: failure(400, "unsupported_protocol_version"), request };
     }
-    // Negotiate from the initialize body, normalize to the one supported version,
-    // and discard any pre-initialize version header. Post-initialize headers stay strict.
-    const normalizedRequest = requestedVersion === MCP_PROTOCOL_VERSION && headerVersion === null
-      ? request
-      : normalizeInitializeRequest(request, payload);
+    if (headerVersion !== null && !SUPPORTED_PROTOCOL_VERSIONS.includes(headerVersion)) {
+      return { error: failure(400, "unsupported_protocol_version"), request };
+    }
+
+    const normalizedRequest = requestedVersion !== MCP_PROTOCOL_VERSION
+      ? normalizeLegacyInitializeRequest(request, payload)
+      : request;
     return { error: null, request: normalizedRequest };
   }
 
-  // The endpoint is stateless and cannot recover an older session's negotiated version.
-  // Per the 2025-11-25 HTTP fallback, an absent header therefore means 2025-03-26.
-  if (headerVersion !== null && headerVersion !== MCP_PROTOCOL_VERSION) {
+  if (headerVersion !== null && !SUPPORTED_PROTOCOL_VERSIONS.includes(headerVersion)) {
     return { error: failure(400, "unsupported_protocol_version"), request };
   }
   return { error: null, request };
@@ -239,10 +234,6 @@ async function redactResponse(response, secret) {
   }
 }
 
-/**
- * Enforce the outer request boundary, authenticate, and verify the project before
- * invoking MCP. The API key exists only in this request's local scope.
- */
 export async function withVerifiedProject(request, { connect, invoke }) {
   if (!validHostHeader(request)) return failure(400, "invalid_host");
   if (!validOrigin(request)) return failure(403, "origin_not_allowed");
@@ -250,7 +241,6 @@ export async function withVerifiedProject(request, { connect, invoke }) {
   const route = parsePinnedProjectRoute(request.url);
   if (!route) return failure(404, "invalid_project_route");
 
-  // Preflight is not an MCP operation and never opens a Framer connection.
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -287,13 +277,11 @@ export async function withVerifiedProject(request, { connect, invoke }) {
     const response = await invoke({ request: protocol.request, route, client });
     return await redactResponse(response, apiKey);
   } catch {
-    // SDK and transport errors are intentionally suppressed; they may contain credentials.
     return failure(502, "framer_request_failed");
   } finally {
     try {
       await client?.disconnect();
     } catch {
-      // Cleanup errors are suppressed to avoid leaking SDK details.
     }
   }
 }
