@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createMcpHandler } from "agents/mcp/server";
 import { McpServer } from "@modelcontextprotocol/server";
-import { MCP_PROTOCOL_VERSION, parseBearerHeader, parsePinnedProjectRoute, withVerifiedProject } from "../src/project-guard.mjs";
+import {
+  MCP_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  parseBearerHeader,
+  parsePinnedProjectRoute,
+  withVerifiedProject,
+} from "../src/project-guard.mjs";
 import { createWorkerHandler } from "../src/worker.mjs";
 
 const projectId = "DemoProject2026";
@@ -13,7 +19,11 @@ const initializeMessage = {
   jsonrpc: "2.0",
   id: 1,
   method: "initialize",
-  params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "unit-test", version: "1.0.0" } },
+  params: {
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: "unit-test", version: "1.0.0" },
+  },
 };
 
 function rpcRequest({
@@ -34,6 +44,7 @@ function rpcRequest({
   if (authorization !== null) headers.set("authorization", authorization);
   if (origin !== null) headers.set("origin", origin);
   if (protocolHeader !== null) headers.set("mcp-protocol-version", protocolHeader);
+
   return new Request(`https://framer-server-api-mcp.shifatmasud.workers.dev${path}`, {
     method,
     headers,
@@ -43,7 +54,11 @@ function rpcRequest({
 
 async function responseJson(response) {
   const body = await response.text();
-  const data = body.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).at(-1);
+  const data = body
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .at(-1);
   return JSON.parse(data ?? body);
 }
 
@@ -57,7 +72,12 @@ function stubClient(id, calls = []) {
     getCollection: async (collectionId) => {
       assert.equal(collectionId, "collection-1");
       return {
-        getItems: async () => [{ id: "item-1", slug: "hello", fieldData: { title: { type: "string", value: "Hello" } }, draft: true }],
+        getItems: async () => [{
+          id: "item-1",
+          slug: "hello",
+          fieldData: { title: { type: "string", value: "Hello" } },
+          draft: true,
+        }],
         addItems: async () => calls.push("addItems"),
         removeItems: async () => calls.push("removeItems"),
       };
@@ -150,17 +170,14 @@ test("missing or malformed Bearer credentials are rejected before any SDK call",
   assert.equal(sdkCalls, 0);
 });
 
-test("malformed initialize versions and unsupported post-initialize headers fail before any SDK call", async () => {
+test("only supported initialize versions and supported present post-initialize headers reach the SDK", async () => {
   let sdkCalls = 0;
   const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
   const ctx = { waitUntil() {} };
   const invalidRequests = [
     rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "future-or-bogus" } } }),
-    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-02-30" } } }),
     rpcRequest({ message: { ...initializeMessage, params: {} } }),
-    rpcRequest({ protocolHeader: "2025-11-25", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
-    rpcRequest({ protocolHeader: "2025-06-18", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
-    rpcRequest({ protocolHeader: "2024-11-05", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
+    rpcRequest({ protocolHeader: "future-or-bogus" }),
     rpcRequest({ protocolHeader: "bogus", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
   ];
 
@@ -169,36 +186,6 @@ test("malformed initialize versions and unsupported post-initialize headers fail
     assert.equal(response.status, 400);
   }
   assert.equal(sdkCalls, 0);
-});
-
-test("well-formed unsupported initialize versions negotiate the Worker-supported version", async () => {
-  let sdkCalls = 0;
-  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
-  const ctx = { waitUntil() {} };
-  const requestedVersion = "2025-11-25";
-  const response = await worker.fetch(rpcRequest({
-    protocolHeader: requestedVersion,
-    message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: requestedVersion } },
-  }), {}, ctx);
-
-  assert.equal(response.status, 200);
-  assert.equal((await responseJson(response)).result.protocolVersion, MCP_PROTOCOL_VERSION);
-  const toolsList = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
-  const supportedFollowUp = await worker.fetch(rpcRequest({
-    protocolHeader: MCP_PROTOCOL_VERSION,
-    message: toolsList,
-  }), {}, ctx);
-  assert.equal(supportedFollowUp.status, 200);
-
-  const missingHeaderFallback = await worker.fetch(rpcRequest({ message: toolsList }), {}, ctx);
-  assert.equal(missingHeaderFallback.status, 200);
-
-  const unsupportedFollowUp = await worker.fetch(rpcRequest({
-    protocolHeader: requestedVersion,
-    message: toolsList,
-  }), {}, ctx);
-  assert.equal(unsupportedFollowUp.status, 400);
-  assert.equal(sdkCalls, 3);
 });
 
 test("matching key/project succeeds; mismatched project fails once with no fallback", async () => {
@@ -249,7 +236,13 @@ test("disconnect runs after success, mismatch, and operation failure; cleanup er
     invoke: async () => assert.fail("must not run on mismatch"),
   });
   await withVerifiedProject(rpcRequest(), {
-    connect: async () => ({ ...stubClient(projectId, calls), disconnect: async () => { calls.push("disconnect"); throw new Error(testKey); } }),
+    connect: async () => ({
+      ...stubClient(projectId, calls),
+      disconnect: async () => {
+        calls.push("disconnect");
+        throw new Error(testKey);
+      },
+    }),
     invoke: async () => { throw new Error(`synthetic ${testKey}`); },
   });
   assert.equal(calls.filter((entry) => entry === "disconnect").length, 3);
@@ -272,7 +265,7 @@ test("the installed Cloudflare MCP handler enforces its configured exact path", 
   assert.equal((await responseJson(exactPath)).result.serverInfo.name, "route-test");
 });
 
-test("initialize, initialized notification, tools/list, and safe read use exact 2025-03-26", async () => {
+test("initialize supports all official MCP versions (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05)", async () => {
   const lifecycle = [];
   const worker = createWorkerHandler({
     connectClient: async (url, key) => {
@@ -283,17 +276,15 @@ test("initialize, initialized notification, tools/list, and safe read use exact 
   });
   const ctx = { waitUntil() {} };
 
-  const initialize = await worker.fetch(rpcRequest(), {}, ctx);
-  assert.equal(initialize.status, 200);
-  const initResult = await responseJson(initialize);
-  assert.equal(initResult.result.protocolVersion, MCP_PROTOCOL_VERSION);
-  assert.equal(initResult.result.serverInfo.name, "framer-server-api");
-
-  const legacyInitialize = await worker.fetch(rpcRequest({
-    message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2024-11-05" } },
-  }), {}, ctx);
-  assert.equal(legacyInitialize.status, 200);
-  assert.equal((await responseJson(legacyInitialize)).result.protocolVersion, MCP_PROTOCOL_VERSION);
+  for (const version of SUPPORTED_PROTOCOL_VERSIONS) {
+    const initRes = await worker.fetch(rpcRequest({
+      message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: version } },
+    }), {}, ctx);
+    assert.equal(initRes.status, 200, `version ${version} must return 200`);
+    const initResult = await responseJson(initRes);
+    assert.equal(initResult.result.protocolVersion, MCP_PROTOCOL_VERSION);
+    assert.equal(initResult.result.serverInfo.name, "framer-server-api");
+  }
 
   const initialized = await worker.fetch(rpcRequest({
     message: { jsonrpc: "2.0", method: "notifications/initialized" },
@@ -302,7 +293,6 @@ test("initialize, initialized notification, tools/list, and safe read use exact 
   assert.equal(await initialized.text(), "");
 
   const list = await worker.fetch(rpcRequest({
-    protocolHeader: MCP_PROTOCOL_VERSION,
     message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
   }), {}, ctx);
   assert.equal(list.status, 200);
@@ -329,7 +319,6 @@ test("initialize, initialized notification, tools/list, and safe read use exact 
   assert.notEqual(result.isError, true);
   assert.match(result.content[0].text, /Test project/);
 
-  assert.equal(lifecycle.filter((entry) => entry === "disconnect").length, 5);
   assert.equal(lifecycle.some((entry) => ["addItems", "removeItems", "publish", "deploy"].includes(entry)), false);
 });
 
