@@ -150,16 +150,15 @@ test("missing or malformed Bearer credentials are rejected before any SDK call",
   assert.equal(sdkCalls, 0);
 });
 
-test("only supported initialize versions and supported present post-initialize headers reach the SDK", async () => {
+test("malformed initialize versions and unsupported post-initialize headers fail before any SDK call", async () => {
   let sdkCalls = 0;
   const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
   const ctx = { waitUntil() {} };
   const invalidRequests = [
-    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-11-25" } } }),
-    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-06-18" } } }),
     rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "future-or-bogus" } } }),
+    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-02-30" } } }),
     rpcRequest({ message: { ...initializeMessage, params: {} } }),
-    rpcRequest({ protocolHeader: "2025-11-25" }),
+    rpcRequest({ protocolHeader: "2025-11-25", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
     rpcRequest({ protocolHeader: "2025-06-18", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
     rpcRequest({ protocolHeader: "2024-11-05", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
     rpcRequest({ protocolHeader: "bogus", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
@@ -170,6 +169,36 @@ test("only supported initialize versions and supported present post-initialize h
     assert.equal(response.status, 400);
   }
   assert.equal(sdkCalls, 0);
+});
+
+test("well-formed unsupported initialize versions negotiate the Worker-supported version", async () => {
+  let sdkCalls = 0;
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const ctx = { waitUntil() {} };
+  const requestedVersion = "2025-11-25";
+  const response = await worker.fetch(rpcRequest({
+    protocolHeader: requestedVersion,
+    message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: requestedVersion } },
+  }), {}, ctx);
+
+  assert.equal(response.status, 200);
+  assert.equal((await responseJson(response)).result.protocolVersion, MCP_PROTOCOL_VERSION);
+  const toolsList = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+  const supportedFollowUp = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: toolsList,
+  }), {}, ctx);
+  assert.equal(supportedFollowUp.status, 200);
+
+  const missingHeaderFallback = await worker.fetch(rpcRequest({ message: toolsList }), {}, ctx);
+  assert.equal(missingHeaderFallback.status, 200);
+
+  const unsupportedFollowUp = await worker.fetch(rpcRequest({
+    protocolHeader: requestedVersion,
+    message: toolsList,
+  }), {}, ctx);
+  assert.equal(unsupportedFollowUp.status, 400);
+  assert.equal(sdkCalls, 3);
 });
 
 test("matching key/project succeeds; mismatched project fails once with no fallback", async () => {

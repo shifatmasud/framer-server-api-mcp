@@ -2,7 +2,17 @@ const PROJECT_ROUTE = /^\/mcp\/projects\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)--([A-Z
 const MAX_BEARER_LENGTH = 4096;
 const BEARER_VALUE = /^[A-Za-z0-9._~+/-]+=*$/;
 export const MCP_PROTOCOL_VERSION = "2025-03-26";
-const LEGACY_PROTOCOL_VERSION = "2024-11-05";
+
+function isWellFormedProtocolVersion(version) {
+  if (typeof version !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(version)) return false;
+  const year = Number(version.slice(0, 4));
+  const month = Number(version.slice(5, 7));
+  const day = Number(version.slice(8, 10));
+  if (year < 1 || month < 1 || month > 12) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth;
+}
 
 // The runtime uses an explicit trusted host allowlist.
 // Reject every unlisted host.
@@ -149,7 +159,7 @@ function failure(status, code) {
   });
 }
 
-function normalizeLegacyInitializeRequest(request, payload) {
+function normalizeInitializeRequest(request, payload) {
   const message = Array.isArray(payload) ? payload[0] : payload;
   const normalizedMessage = {
     ...message,
@@ -161,6 +171,7 @@ function normalizeLegacyInitializeRequest(request, payload) {
   headers.delete("content-length");
   headers.delete("content-encoding");
   headers.delete("transfer-encoding");
+  headers.delete("mcp-protocol-version");
   return new Request(request.url, {
     method: "POST",
     headers,
@@ -189,18 +200,14 @@ async function validateProtocol(request) {
       return { error: failure(400, "invalid_mcp_request"), request };
     }
     const requestedVersion = initializeMessages[0].params?.protocolVersion;
-    if (requestedVersion !== MCP_PROTOCOL_VERSION && requestedVersion !== LEGACY_PROTOCOL_VERSION) {
+    if (!isWellFormedProtocolVersion(requestedVersion)) {
       return { error: failure(400, "unsupported_protocol_version"), request };
     }
-    // The version header is for requests after initialization. If a client supplies
-    // it anyway, accept only the implementation's actual version, never an echoable value.
-    if (headerVersion !== null && headerVersion !== MCP_PROTOCOL_VERSION) {
-      return { error: failure(400, "unsupported_protocol_version"), request };
-    }
-
-    const normalizedRequest = requestedVersion === LEGACY_PROTOCOL_VERSION
-      ? normalizeLegacyInitializeRequest(request, payload)
-      : request;
+    // Negotiate from the initialize body, normalize to the one supported version,
+    // and discard any pre-initialize version header. Post-initialize headers stay strict.
+    const normalizedRequest = requestedVersion === MCP_PROTOCOL_VERSION && headerVersion === null
+      ? request
+      : normalizeInitializeRequest(request, payload);
     return { error: null, request: normalizedRequest };
   }
 
