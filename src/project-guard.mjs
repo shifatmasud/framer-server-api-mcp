@@ -1,5 +1,6 @@
 const PROJECT_ROUTE = /^\/mcp\/projects\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)--([A-Za-z0-9]{8,64})$/;
 const MAX_BEARER_LENGTH = 4096;
+const BEARER_VALUE = /^[A-Za-z0-9._~+/-]+=*$/;
 
 export function parsePinnedProjectRoute(requestUrl) {
   let url;
@@ -18,6 +19,7 @@ export function parsePinnedProjectRoute(requestUrl) {
   return {
     slug,
     projectId,
+    pathname: url.pathname,
     projectUrl: `https://framer.com/projects/${projectSlugAndId}`,
   };
 }
@@ -26,35 +28,70 @@ export function parseBearerHeader(headerValue) {
   if (typeof headerValue !== "string" || headerValue.length > MAX_BEARER_LENGTH + 7) {
     return null;
   }
-  const match = /^Bearer ([^\s]+)$/i.exec(headerValue);
-  if (!match || match[1].length > MAX_BEARER_LENGTH) return null;
+  const match = /^Bearer ([A-Za-z0-9._~+/-]+=*)$/i.exec(headerValue);
+  if (!match || match[1].length > MAX_BEARER_LENGTH || !BEARER_VALUE.test(match[1])) {
+    return null;
+  }
   return match[1];
 }
 
 function failure(status, code) {
-  return { status, body: { error: code } };
+  return new Response(JSON.stringify({ error: code }), {
+    status,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "application/json; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    },
+  });
 }
 
 function responseContainsSecret(value, secret) {
-  if (typeof value === "string") return value.includes(secret);
+  return typeof value === "string" && value.includes(secret);
+}
+
+async function redactResponse(response, secret) {
+  if (!(response instanceof Response)) return failure(502, "framer_request_failed");
+
   try {
-    return JSON.stringify(value)?.includes(secret) ?? false;
+    const body = await response.text();
+    if (responseContainsSecret(body, secret)) return failure(502, "framer_request_failed");
+    return new Response(body || null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   } catch {
-    return true;
+    return failure(502, "framer_request_failed");
   }
 }
 
 /**
- * Request-scoped guard seam. The caller must run MCP handling inside `run`
- * and return fully materialized data before this function disconnects.
- * The Bearer is treated as the selected project's Framer key; it is never
- * persisted or returned by this helper.
+ * Authenticate and verify a project before invoking its MCP handler. The API
+ * key exists only in this request's local scope and is never persisted.
  */
-export async function withVerifiedProject(request, { connect, run }) {
-  if (request.method !== "POST") return failure(405, "method_not_allowed");
-
+export async function withVerifiedProject(request, { connect, invoke }) {
   const route = parsePinnedProjectRoute(request.url);
   if (!route) return failure(404, "invalid_project_route");
+
+  // Preflight is not an MCP operation and never opens a Framer connection.
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: { allow: "POST, OPTIONS", "cache-control": "no-store" },
+    });
+  }
+  if (request.method !== "POST") {
+    return new Response(JSON.stringify({ error: "method_not_allowed" }), {
+      status: 405,
+      headers: {
+        allow: "POST, OPTIONS",
+        "cache-control": "no-store",
+        "content-type": "application/json; charset=utf-8",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  }
 
   const apiKey = parseBearerHeader(request.headers.get("authorization"));
   if (!apiKey) return failure(401, "unauthorized");
@@ -65,17 +102,16 @@ export async function withVerifiedProject(request, { connect, run }) {
     const info = await client.getProjectInfo();
     if (info?.id !== route.projectId) return failure(403, "project_key_mismatch");
 
-    const body = await run({ request, route, client });
-    if (responseContainsSecret(body, apiKey)) return failure(502, "framer_request_failed");
-    return { status: 200, body };
+    const response = await invoke({ request, route, client });
+    return await redactResponse(response, apiKey);
   } catch {
-    // SDK error text is intentionally not returned; it may contain credentials.
+    // SDK and transport errors are intentionally suppressed; they may contain credentials.
     return failure(502, "framer_request_failed");
   } finally {
     try {
       await client?.disconnect();
     } catch {
-      // Do not leak SDK errors from cleanup.
+      // Cleanup errors are suppressed to avoid leaking SDK details.
     }
   }
 }
