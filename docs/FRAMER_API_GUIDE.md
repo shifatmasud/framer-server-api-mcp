@@ -126,5 +126,3 @@ Never put secrets in this guide, the HTML companion, source control, prompts, br
 - [Complete method and argument inventory](FRAMER_METHOD_INVENTORY.md)
 - [Upsy setup and request-policy notes](UPSY_SETUP.md)
 - [Repository README](../README.md)
-
-The companion is also attached to the corresponding Notion usage-guide page. Notion displays uploaded HTML in a sandboxed embed; if its preview suppresses script behavior, download the HTML file and open it locally in a modern browser to use the search, filters, schema viewer, and checklist. Notion page URL: to be added after publication.
