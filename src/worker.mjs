@@ -11,8 +11,9 @@ export function createWorkerHandler({ connectClient = connect } = {}) {
         invoke: ({ request: verifiedRequest, route, client }) => {
           const handler = createMcpHandler(() => createFramerMcpServer(client), {
             route: route.pathname,
-            responseMode: "json",
+            responseMode: "auto",
             legacy: "stateless",
+            allowedHostnames: ["framer-server-api-mcp.shifatmasud.workers.dev"],
             // Never send SDK exceptions to platform logs; response content is checked for the key.
             onerror: () => {},
           });

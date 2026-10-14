@@ -1,6 +1,16 @@
 const PROJECT_ROUTE = /^\/mcp\/projects\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)--([A-Za-z0-9]{8,64})$/;
 const MAX_BEARER_LENGTH = 4096;
 const BEARER_VALUE = /^[A-Za-z0-9._~+/-]+=*$/;
+export const MCP_PROTOCOL_VERSION = "2025-03-26";
+
+// The runtime uses an explicit trusted host allowlist.
+// Reject every unlisted host.
+const TRUSTED_WORKER_HOSTS = Object.freeze([
+  "framer-server-api-mcp.shifatmasud.workers.dev",
+]);
+// A present Origin must exactly match the configured allowlist.
+// Keep the allowlist empty until an intended browser origin is explicitly verified.
+const VERIFIED_UPSY_ORIGINS = Object.freeze([]);
 
 export function parsePinnedProjectRoute(requestUrl) {
   let url;
@@ -35,6 +45,56 @@ export function parseBearerHeader(headerValue) {
   return match[1];
 }
 
+function validHostname(hostname) {
+  if (/^\[[0-9a-fA-F:.]+\]$/.test(hostname)) return true;
+  if (/^\d+(?:\.\d+){3}$/.test(hostname)) {
+    return hostname.split(".").every((part) => Number(part) <= 255);
+  }
+  if (hostname.length === 0 || hostname.length > 253) return false;
+  return hostname.split(".").every((label) =>
+    label.length > 0 && label.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label),
+  );
+}
+
+function validHostHeader(request) {
+  let requestUrl;
+  try {
+    requestUrl = new URL(request.url);
+  } catch {
+    return false;
+  }
+
+  const host = request.headers.get("host");
+  if (!host || host.length > 300 || host !== host.trim() || /[\s\\/@?#]/.test(host)) return false;
+
+  let authority;
+  try {
+    authority = new URL(`${requestUrl.protocol}//${host}`);
+  } catch {
+    return false;
+  }
+
+  if (
+    authority.username || authority.password || authority.pathname !== "/" || authority.search || authority.hash ||
+    authority.protocol !== requestUrl.protocol || authority.host.toLowerCase() !== requestUrl.host.toLowerCase() ||
+    !validHostname(authority.hostname)
+  ) {
+    return false;
+  }
+
+  const hostname = authority.hostname.toLowerCase();
+  const trustedProductionHost = TRUSTED_WORKER_HOSTS.includes(hostname);
+  const localWranglerHost = requestUrl.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "[::1]"].includes(hostname);
+  return trustedProductionHost || localWranglerHost;
+}
+
+function validOrigin(request) {
+  if (!request.headers.has("origin")) return true;
+  const origin = request.headers.get("origin");
+  return typeof origin === "string" && VERIFIED_UPSY_ORIGINS.includes(origin);
+}
+
 function failure(status, code) {
   return new Response(JSON.stringify({ error: code }), {
     status,
@@ -44,6 +104,45 @@ function failure(status, code) {
       "x-content-type-options": "nosniff",
     },
   });
+}
+
+async function validateProtocol(request) {
+  let payload;
+  try {
+    payload = await request.clone().json();
+  } catch {
+    return failure(400, "invalid_mcp_request");
+  }
+
+  const messages = Array.isArray(payload) ? payload : [payload];
+  if (messages.length === 0 || messages.some((message) => !message || typeof message !== "object")) {
+    return failure(400, "invalid_mcp_request");
+  }
+
+  const initializeMessages = messages.filter((message) => message.method === "initialize");
+  const headerVersion = request.headers.get("mcp-protocol-version");
+
+  if (initializeMessages.length > 0) {
+    if (messages.length !== 1 || initializeMessages.length !== 1) {
+      return failure(400, "invalid_mcp_request");
+    }
+    if (initializeMessages[0].params?.protocolVersion !== MCP_PROTOCOL_VERSION) {
+      return failure(400, "unsupported_protocol_version");
+    }
+    // Initialization has not negotiated a version yet; if the header is present,
+    // it must still agree with the only version this endpoint supports.
+    if (headerVersion !== null && headerVersion !== MCP_PROTOCOL_VERSION) {
+      return failure(400, "unsupported_protocol_version");
+    }
+    return null;
+  }
+
+  // This server is stateless, so require the agreed version on every non-initialize
+  // request/notification, including notifications/initialized.
+  if (headerVersion !== MCP_PROTOCOL_VERSION) {
+    return failure(400, "unsupported_protocol_version");
+  }
+  return null;
 }
 
 function responseContainsSecret(value, secret) {
@@ -67,10 +166,13 @@ async function redactResponse(response, secret) {
 }
 
 /**
- * Authenticate and verify a project before invoking its MCP handler. The API
- * key exists only in this request's local scope and is never persisted.
+ * Enforce the outer request boundary, authenticate, and verify the project before
+ * invoking MCP. The API key exists only in this request's local scope.
  */
 export async function withVerifiedProject(request, { connect, invoke }) {
+  if (!validHostHeader(request)) return failure(400, "invalid_host");
+  if (!validOrigin(request)) return failure(403, "origin_not_allowed");
+
   const route = parsePinnedProjectRoute(request.url);
   if (!route) return failure(404, "invalid_project_route");
 
@@ -95,6 +197,9 @@ export async function withVerifiedProject(request, { connect, invoke }) {
 
   const apiKey = parseBearerHeader(request.headers.get("authorization"));
   if (!apiKey) return failure(401, "unauthorized");
+
+  const protocolError = await validateProtocol(request);
+  if (protocolError) return protocolError;
 
   let client;
   try {

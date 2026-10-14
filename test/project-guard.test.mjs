@@ -2,23 +2,40 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createMcpHandler } from "agents/mcp/server";
 import { McpServer } from "@modelcontextprotocol/server";
-import { parseBearerHeader, parsePinnedProjectRoute, withVerifiedProject } from "../src/project-guard.mjs";
+import { MCP_PROTOCOL_VERSION, parseBearerHeader, parsePinnedProjectRoute, withVerifiedProject } from "../src/project-guard.mjs";
 import { createWorkerHandler } from "../src/worker.mjs";
 
 const projectId = "DemoProject2026";
 const routePath = `/mcp/projects/Sample-Site--${projectId}`;
 const projectUrl = `https://framer.com/projects/Sample-Site--${projectId}`;
 const testKey = "unit-test-key-42";
+const initializeMessage = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "unit-test", version: "1.0.0" } },
+};
 
-function rpcRequest({ path = routePath, authorization = `Bearer ${testKey}`, method = "POST", message = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "unit-test", version: "1.0.0" } } } } = {}) {
-  return new Request(`https://worker.example${path}`, {
+function rpcRequest({
+  path = routePath,
+  authorization = `Bearer ${testKey}`,
+  host = "framer-server-api-mcp.shifatmasud.workers.dev",
+  origin = null,
+  protocolHeader = null,
+  method = "POST",
+  message = initializeMessage,
+} = {}) {
+  const headers = new Headers({
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+  });
+  if (host !== null) headers.set("host", host);
+  if (authorization !== null) headers.set("authorization", authorization);
+  if (origin !== null) headers.set("origin", origin);
+  if (protocolHeader !== null) headers.set("mcp-protocol-version", protocolHeader);
+  return new Request(`https://framer-server-api-mcp.shifatmasud.workers.dev${path}`, {
     method,
-    headers: {
-      host: "worker.example",
-      ...(authorization === null ? {} : { authorization }),
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-    },
+    headers,
     body: method === "POST" ? JSON.stringify(message) : undefined,
   });
 }
@@ -51,7 +68,7 @@ function stubClient(id, calls = []) {
 }
 
 test("project route accepts one canonical slug--id path and rejects malformed or unknown selectors", async (t) => {
-  const parsed = parsePinnedProjectRoute(`https://worker.example${routePath}`);
+  const parsed = parsePinnedProjectRoute(`https://framer-server-api-mcp.shifatmasud.workers.dev${routePath}`);
   assert.equal(parsed?.projectId, projectId);
   assert.equal(parsed?.projectUrl, projectUrl);
   assert.equal(parsed?.pathname, routePath);
@@ -64,8 +81,25 @@ test("project route accepts one canonical slug--id path and rejects malformed or
     `/mcp/projects/Sample-Site--${projectId}%2Fother`,
     "/mcp/projects/../other--DemoProject2026",
   ]) {
-    await t.test(path, () => assert.equal(parsePinnedProjectRoute(`https://worker.example${path}`), null));
+    await t.test(path, () => assert.equal(parsePinnedProjectRoute(`https://framer-server-api-mcp.shifatmasud.workers.dev${path}`), null));
   }
+});
+
+test("invalid, missing, or mismatched Host and any unverified present Origin fail in outer fetch before Framer SDK calls", async () => {
+  let sdkCalls = 0;
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const ctx = { waitUntil() {} };
+
+  for (const host of [null, "attacker.example", "framer-server-api-mcp.shifatmasud.workers.dev/extra", "bad host"]) {
+    const response = await worker.fetch(rpcRequest({ host }), {}, ctx);
+    assert.equal(response.status, 400, `host ${String(host)} must be rejected`);
+  }
+
+  for (const origin of ["https://unverified.invalid", "null", ""]) {
+    const response = await worker.fetch(rpcRequest({ origin }), {}, ctx);
+    assert.equal(response.status, 403, `Origin ${JSON.stringify(origin)} must be rejected`);
+  }
+  assert.equal(sdkCalls, 0);
 });
 
 test("missing or malformed Bearer credentials are rejected before any SDK call", async () => {
@@ -82,6 +116,27 @@ test("missing or malformed Bearer credentials are rejected before any SDK call",
       invoke: async () => new Response("unexpected"),
     });
     assert.equal(response.status, 401);
+  }
+  assert.equal(sdkCalls, 0);
+});
+
+test("only initialize protocol 2025-03-26 and exact post-initialize version headers reach the SDK", async () => {
+  let sdkCalls = 0;
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const ctx = { waitUntil() {} };
+  const invalidRequests = [
+    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-11-25" } } }),
+    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "future-or-bogus" } } }),
+    rpcRequest({ message: { ...initializeMessage, params: {} } }),
+    rpcRequest({ protocolHeader: "2025-11-25" }),
+    rpcRequest({ message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
+    rpcRequest({ protocolHeader: "2025-11-25", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
+    rpcRequest({ message: { jsonrpc: "2.0", method: "notifications/initialized" } }),
+  ];
+
+  for (const request of invalidRequests) {
+    const response = await worker.fetch(request, {}, ctx);
+    assert.equal(response.status, 400);
   }
   assert.equal(sdkCalls, 0);
 });
@@ -145,7 +200,7 @@ test("the installed Cloudflare MCP handler enforces its configured exact path", 
   const handler = createMcpHandler(() => {
     serverCreated++;
     return new McpServer({ name: "route-test", version: "1.0.0" });
-  }, { route: routePath, responseMode: "json", allowedHostnames: ["worker.example"] });
+  }, { route: routePath, responseMode: "auto", allowedHostnames: ["framer-server-api-mcp.shifatmasud.workers.dev"] });
 
   const wrongPath = await handler(rpcRequest({ path: `${routePath}/other` }), {}, { waitUntil() {} });
   assert.equal(wrongPath.status, 404);
@@ -157,7 +212,7 @@ test("the installed Cloudflare MCP handler enforces its configured exact path", 
   assert.equal((await responseJson(exactPath)).result.serverInfo.name, "route-test");
 });
 
-test("real initialize, tools/list, and a safe read pass through the same project guard", async () => {
+test("initialize, initialized notification, tools/list, and safe read use exact 2025-03-26", async () => {
   const lifecycle = [];
   const worker = createWorkerHandler({
     connectClient: async (url, key) => {
@@ -171,9 +226,20 @@ test("real initialize, tools/list, and a safe read pass through the same project
   const initialize = await worker.fetch(rpcRequest(), {}, ctx);
   assert.equal(initialize.status, 200);
   const initResult = await responseJson(initialize);
+  assert.equal(initResult.result.protocolVersion, MCP_PROTOCOL_VERSION);
   assert.equal(initResult.result.serverInfo.name, "framer-server-api");
 
-  const list = await worker.fetch(rpcRequest({ message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }), {}, ctx);
+  const initialized = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: { jsonrpc: "2.0", method: "notifications/initialized" },
+  }), {}, ctx);
+  assert.equal(initialized.status, 202);
+  assert.equal(await initialized.text(), "");
+
+  const list = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+  }), {}, ctx);
   assert.equal(list.status, 200);
   const tools = (await responseJson(list)).result.tools;
   const names = tools.map((tool) => tool.name);
@@ -183,14 +249,50 @@ test("real initialize, tools/list, and a safe read pass through the same project
   assert.ok(names.includes("framer_publish_preview"));
   assert.ok(names.includes("framer_deploy_published_version"));
 
-  const call = await worker.fetch(rpcRequest({ message: { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "framer_get_project_info", arguments: {} } } }), {}, ctx);
+  const gatedNames = ["framer_upsert_cms_items", "framer_delete_cms_items", "framer_publish_preview", "framer_deploy_published_version"];
+  for (const name of gatedNames) {
+    const schema = tools.find((tool) => tool.name === name)?.inputSchema;
+    assert.ok(schema?.properties?.confirm, `${name} schema must expose confirm`);
+    assert.ok(schema.required?.includes("confirm"), `${name} must require confirm`);
+  }
+
+  const call = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "framer_get_project_info", arguments: {} } },
+  }), {}, ctx);
   assert.equal(call.status, 200);
   const result = (await responseJson(call)).result;
   assert.notEqual(result.isError, true);
   assert.match(result.content[0].text, /Test project/);
 
-  assert.equal(lifecycle.filter((entry) => entry === "disconnect").length, 3);
+  assert.equal(lifecycle.filter((entry) => entry === "disconnect").length, 4);
   assert.equal(lifecycle.some((entry) => ["addItems", "removeItems", "publish", "deploy"].includes(entry)), false);
+});
+
+test("dangerous tools reject missing or false confirmation without invoking any Framer write or release method", async () => {
+  const actions = [];
+  const worker = createWorkerHandler({ connectClient: async () => stubClient(projectId, actions) });
+  const ctx = { waitUntil() {} };
+  const cases = [
+    ["framer_upsert_cms_items", { collectionId: "collection-1", items: [{ slug: "new-item" }] }],
+    ["framer_delete_cms_items", { collectionId: "collection-1", itemIds: ["item-1"] }],
+    ["framer_publish_preview", {}],
+    ["framer_deploy_published_version", { deploymentId: "deployment-1" }],
+  ];
+
+  for (const [name, args] of cases) {
+    for (const withFalse of [false, true]) {
+      const rejectedArgs = withFalse ? { ...args, confirm: false } : args;
+      const response = await worker.fetch(rpcRequest({
+        protocolHeader: MCP_PROTOCOL_VERSION,
+        message: { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name, arguments: rejectedArgs } },
+      }), {}, ctx);
+      assert.equal(response.status, 200);
+      const reply = await responseJson(response);
+      assert.ok(reply.error || reply.result?.isError === true, `${name} without confirm:true must fail`);
+    }
+  }
+  assert.equal(actions.some((entry) => ["addItems", "removeItems", "publish", "deploy"].includes(entry)), false);
 });
 
 test("unknown routes and non-POST methods fail before SDK work", async () => {
