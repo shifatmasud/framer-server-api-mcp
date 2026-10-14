@@ -218,6 +218,11 @@ function responseContainsSecret(value, secret) {
   return typeof value === "string" && value.includes(secret);
 }
 
+async function hashProjectId(projectId) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(projectId));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function redactResponse(response, secret) {
   if (!(response instanceof Response)) return failure(502, "framer_request_failed");
 
@@ -272,7 +277,7 @@ export async function withVerifiedProject(request, { connect, invoke }) {
   try {
     client = await connect(route.projectUrl, apiKey);
     const info = await client.getProjectInfo();
-    if (info?.id !== route.projectId) return failure(403, "project_key_mismatch");
+    if (info?.id !== await hashProjectId(route.projectId)) return failure(403, "project_key_mismatch");
 
     const response = await invoke({ request: protocol.request, route, client });
     return await redactResponse(response, apiKey);

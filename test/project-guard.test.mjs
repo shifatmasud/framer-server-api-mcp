@@ -12,6 +12,7 @@ import {
 import { createWorkerHandler } from "../src/worker.mjs";
 
 const projectId = "DemoProject2026";
+const sdkProjectId = "54e00f7d5c47d81e20ed1e5ebe223d2644c9cf4cc62165f5b5f47a0ffd17745b";
 const routePath = `/mcp/projects/Sample-Site--${projectId}`;
 const projectUrl = `https://framer.com/projects/Sample-Site--${projectId}`;
 const testKey = "unit-test-key-42";
@@ -108,7 +109,7 @@ test("project route accepts one canonical slug--id path and rejects malformed or
 
 test("invalid, missing, or mismatched Host and any unverified present Origin fail in outer fetch before Framer SDK calls", async () => {
   let sdkCalls = 0;
-  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(sdkProjectId); } });
   const ctx = { waitUntil() {} };
 
   for (const host of [null, "attacker.example", "framer-server-api-mcp.shifatmasud.workers.dev/extra", "bad host"]) {
@@ -125,7 +126,7 @@ test("invalid, missing, or mismatched Host and any unverified present Origin fai
 
 test("invalid Content-Type and Accept fail in outer fetch before any Framer SDK call", async () => {
   let sdkCalls = 0;
-  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(sdkProjectId); } });
   const ctx = { waitUntil() {} };
   const invalidRequests = [
     [rpcRequest({ contentType: null }), 415],
@@ -162,7 +163,7 @@ test("missing or malformed Bearer credentials are rejected before any SDK call",
   let sdkCalls = 0;
   for (const authorization of [null, "Basic abc", "Bearer", "Bearer abc def", `Bearer ${"x".repeat(5000)}`]) {
     const response = await withVerifiedProject(rpcRequest({ authorization }), {
-      connect: async () => { sdkCalls++; return stubClient(projectId); },
+      connect: async () => { sdkCalls++; return stubClient(sdkProjectId); },
       invoke: async () => new Response("unexpected"),
     });
     assert.equal(response.status, 401);
@@ -172,7 +173,7 @@ test("missing or malformed Bearer credentials are rejected before any SDK call",
 
 test("only supported initialize versions and supported present post-initialize headers reach the SDK", async () => {
   let sdkCalls = 0;
-  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(sdkProjectId); } });
   const ctx = { waitUntil() {} };
   const invalidRequests = [
     rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "future-or-bogus" } } }),
@@ -188,17 +189,54 @@ test("only supported initialize versions and supported present post-initialize h
   assert.equal(sdkCalls, 0);
 });
 
-test("matching key/project succeeds; mismatched project fails once with no fallback", async () => {
+test("supported initialize versions normalize and unsupported post-initialize headers fail", async () => {
+  let sdkCalls = 0;
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(sdkProjectId); } });
+  const ctx = { waitUntil() {} };
+  const requestedVersion = "2025-11-25";
+  const unsupportedVersion = "2025-11-26";
+  const response = await worker.fetch(rpcRequest({
+    protocolHeader: requestedVersion,
+    message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: requestedVersion } },
+  }), {}, ctx);
+
+  assert.equal(response.status, 200);
+  assert.equal((await responseJson(response)).result.protocolVersion, MCP_PROTOCOL_VERSION);
+  const toolsList = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+  const supportedFollowUp = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: toolsList,
+  }), {}, ctx);
+  assert.equal(supportedFollowUp.status, 200);
+
+  const missingHeaderFallback = await worker.fetch(rpcRequest({ message: toolsList }), {}, ctx);
+  assert.equal(missingHeaderFallback.status, 200);
+
+  const unsupportedFollowUp = await worker.fetch(rpcRequest({
+    protocolHeader: unsupportedVersion,
+    message: toolsList,
+  }), {}, ctx);
+  assert.equal(unsupportedFollowUp.status, 400);
+  assert.equal(sdkCalls, 3);
+});
+
+test("SDK project hash matches the pinned route; raw suffix and mismatched project are rejected", async () => {
   const calls = [];
   const success = await withVerifiedProject(rpcRequest(), {
     connect: async (url, key) => {
       calls.push({ url, key });
-      return stubClient(projectId);
+      return stubClient(sdkProjectId);
     },
     invoke: async ({ route }) => new Response(JSON.stringify({ projectId: route.projectId }), { headers: { "content-type": "application/json" } }),
   });
   assert.equal(success.status, 200);
   assert.deepEqual(calls[0], { url: projectUrl, key: testKey });
+
+  const rawSuffix = await withVerifiedProject(rpcRequest(), {
+    connect: async () => stubClient(projectId),
+    invoke: async () => assert.fail("must not dispatch when SDK returns the raw route suffix"),
+  });
+  assert.equal(rawSuffix.status, 403);
 
   let fallbackAttempts = 0;
   const mismatch = await withVerifiedProject(rpcRequest(), {
@@ -218,7 +256,7 @@ test("SDK errors and attempted key-bearing MCP responses are redacted", async ()
   assert.equal((await thrown.text()).includes(testKey), false);
 
   const echoed = await withVerifiedProject(rpcRequest(), {
-    connect: async () => stubClient(projectId),
+    connect: async () => stubClient(sdkProjectId),
     invoke: async () => new Response(JSON.stringify({ text: `unexpected ${testKey}` })),
   });
   assert.equal(echoed.status, 502);
@@ -228,7 +266,7 @@ test("SDK errors and attempted key-bearing MCP responses are redacted", async ()
 test("disconnect runs after success, mismatch, and operation failure; cleanup errors are suppressed", async () => {
   const calls = [];
   await withVerifiedProject(rpcRequest(), {
-    connect: async () => stubClient(projectId, calls),
+    connect: async () => stubClient(sdkProjectId, calls),
     invoke: async () => new Response("{}"),
   });
   await withVerifiedProject(rpcRequest(), {
@@ -236,13 +274,7 @@ test("disconnect runs after success, mismatch, and operation failure; cleanup er
     invoke: async () => assert.fail("must not run on mismatch"),
   });
   await withVerifiedProject(rpcRequest(), {
-    connect: async () => ({
-      ...stubClient(projectId, calls),
-      disconnect: async () => {
-        calls.push("disconnect");
-        throw new Error(testKey);
-      },
-    }),
+    connect: async () => ({ ...stubClient(sdkProjectId, calls), disconnect: async () => { calls.push("disconnect"); throw new Error(testKey); } }),
     invoke: async () => { throw new Error(`synthetic ${testKey}`); },
   });
   assert.equal(calls.filter((entry) => entry === "disconnect").length, 3);
@@ -271,7 +303,7 @@ test("initialize supports all official MCP versions (2025-11-25, 2025-06-18, 202
     connectClient: async (url, key) => {
       assert.equal(url, projectUrl);
       assert.equal(key, testKey);
-      return stubClient(projectId, lifecycle);
+      return stubClient(sdkProjectId, lifecycle);
     },
   });
   const ctx = { waitUntil() {} };
@@ -324,7 +356,7 @@ test("initialize supports all official MCP versions (2025-11-25, 2025-06-18, 202
 
 test("dangerous tools reject missing or false confirmation without invoking any Framer write or release method", async () => {
   const actions = [];
-  const worker = createWorkerHandler({ connectClient: async () => stubClient(projectId, actions) });
+  const worker = createWorkerHandler({ connectClient: async () => stubClient(sdkProjectId, actions) });
   const ctx = { waitUntil() {} };
   const cases = [
     ["framer_upsert_cms_items", { collectionId: "collection-1", items: [{ slug: "new-item" }] }],
@@ -350,7 +382,7 @@ test("dangerous tools reject missing or false confirmation without invoking any 
 
 test("unknown routes and non-POST methods fail before SDK work", async () => {
   let sdkCalls = 0;
-  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(sdkProjectId); } });
   assert.equal((await worker.fetch(rpcRequest({ path: "/mcp/projects/not-valid" }), {}, { waitUntil() {} })).status, 404);
   assert.equal((await worker.fetch(rpcRequest({ method: "GET" }), {}, { waitUntil() {} })).status, 405);
   assert.equal(sdkCalls, 0);
