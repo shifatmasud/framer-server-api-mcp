@@ -23,12 +23,13 @@ function rpcRequest({
   origin = null,
   protocolHeader = null,
   method = "POST",
+  contentType = "application/json",
+  accept = "application/json, text/event-stream",
   message = initializeMessage,
 } = {}) {
-  const headers = new Headers({
-    "content-type": "application/json",
-    accept: "application/json, text/event-stream",
-  });
+  const headers = new Headers();
+  if (contentType !== null) headers.set("content-type", contentType);
+  if (accept !== null) headers.set("accept", accept);
   if (host !== null) headers.set("host", host);
   if (authorization !== null) headers.set("authorization", authorization);
   if (origin !== null) headers.set("origin", origin);
@@ -102,6 +103,35 @@ test("invalid, missing, or mismatched Host and any unverified present Origin fai
   assert.equal(sdkCalls, 0);
 });
 
+test("invalid Content-Type and Accept fail in outer fetch before any Framer SDK call", async () => {
+  let sdkCalls = 0;
+  const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
+  const ctx = { waitUntil() {} };
+  const invalidRequests = [
+    [rpcRequest({ contentType: null }), 415],
+    [rpcRequest({ contentType: "text/plain" }), 415],
+    [rpcRequest({ contentType: "application/jsonp" }), 415],
+    [rpcRequest({ accept: null }), 406],
+    [rpcRequest({ accept: "application/json" }), 406],
+    [rpcRequest({ accept: "text/event-stream" }), 406],
+    [rpcRequest({ accept: "application/json;q=0, text/event-stream" }), 406],
+    [rpcRequest({ accept: "*/*" }), 406],
+  ];
+
+  for (const [request, expectedStatus] of invalidRequests) {
+    const response = await worker.fetch(request, {}, ctx);
+    assert.equal(response.status, expectedStatus);
+  }
+
+  const validMediaTypes = await worker.fetch(rpcRequest({
+    authorization: null,
+    contentType: "application/json; charset=utf-8",
+    accept: "application/json;q=0.9, text/event-stream;q=0.8",
+  }), {}, ctx);
+  assert.equal(validMediaTypes.status, 401);
+  assert.equal(sdkCalls, 0);
+});
+
 test("missing or malformed Bearer credentials are rejected before any SDK call", async () => {
   assert.equal(parseBearerHeader(null), null);
   assert.equal(parseBearerHeader("Basic abc"), null);
@@ -120,18 +150,19 @@ test("missing or malformed Bearer credentials are rejected before any SDK call",
   assert.equal(sdkCalls, 0);
 });
 
-test("only initialize protocol 2025-03-26 and exact post-initialize version headers reach the SDK", async () => {
+test("only supported initialize versions and supported present post-initialize headers reach the SDK", async () => {
   let sdkCalls = 0;
   const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(projectId); } });
   const ctx = { waitUntil() {} };
   const invalidRequests = [
     rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-11-25" } } }),
+    rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2025-06-18" } } }),
     rpcRequest({ message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "future-or-bogus" } } }),
     rpcRequest({ message: { ...initializeMessage, params: {} } }),
     rpcRequest({ protocolHeader: "2025-11-25" }),
-    rpcRequest({ message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
-    rpcRequest({ protocolHeader: "2025-11-25", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
-    rpcRequest({ message: { jsonrpc: "2.0", method: "notifications/initialized" } }),
+    rpcRequest({ protocolHeader: "2025-06-18", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
+    rpcRequest({ protocolHeader: "2024-11-05", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
+    rpcRequest({ protocolHeader: "bogus", message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} } }),
   ];
 
   for (const request of invalidRequests) {
@@ -229,8 +260,13 @@ test("initialize, initialized notification, tools/list, and safe read use exact 
   assert.equal(initResult.result.protocolVersion, MCP_PROTOCOL_VERSION);
   assert.equal(initResult.result.serverInfo.name, "framer-server-api");
 
+  const legacyInitialize = await worker.fetch(rpcRequest({
+    message: { ...initializeMessage, params: { ...initializeMessage.params, protocolVersion: "2024-11-05" } },
+  }), {}, ctx);
+  assert.equal(legacyInitialize.status, 200);
+  assert.equal((await responseJson(legacyInitialize)).result.protocolVersion, MCP_PROTOCOL_VERSION);
+
   const initialized = await worker.fetch(rpcRequest({
-    protocolHeader: MCP_PROTOCOL_VERSION,
     message: { jsonrpc: "2.0", method: "notifications/initialized" },
   }), {}, ctx);
   assert.equal(initialized.status, 202);
@@ -257,7 +293,6 @@ test("initialize, initialized notification, tools/list, and safe read use exact 
   }
 
   const call = await worker.fetch(rpcRequest({
-    protocolHeader: MCP_PROTOCOL_VERSION,
     message: { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "framer_get_project_info", arguments: {} } },
   }), {}, ctx);
   assert.equal(call.status, 200);
@@ -265,7 +300,7 @@ test("initialize, initialized notification, tools/list, and safe read use exact 
   assert.notEqual(result.isError, true);
   assert.match(result.content[0].text, /Test project/);
 
-  assert.equal(lifecycle.filter((entry) => entry === "disconnect").length, 4);
+  assert.equal(lifecycle.filter((entry) => entry === "disconnect").length, 5);
   assert.equal(lifecycle.some((entry) => ["addItems", "removeItems", "publish", "deploy"].includes(entry)), false);
 });
 

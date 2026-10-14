@@ -2,6 +2,7 @@ const PROJECT_ROUTE = /^\/mcp\/projects\/([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)--([A-Z
 const MAX_BEARER_LENGTH = 4096;
 const BEARER_VALUE = /^[A-Za-z0-9._~+/-]+=*$/;
 export const MCP_PROTOCOL_VERSION = "2025-03-26";
+const LEGACY_PROTOCOL_VERSION = "2024-11-05";
 
 // The runtime uses an explicit trusted host allowlist.
 // Reject every unlisted host.
@@ -95,6 +96,48 @@ function validOrigin(request) {
   return typeof origin === "string" && VERIFIED_UPSY_ORIGINS.includes(origin);
 }
 
+function validJsonContentType(request) {
+  const value = request.headers.get("content-type");
+  if (typeof value !== "string") return false;
+  return /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(value.trim());
+}
+
+function mediaRangeIsAccepted(acceptHeader, requiredType) {
+  for (const range of acceptHeader.split(",")) {
+    const parameters = range.split(";");
+    const mediaType = parameters.shift()?.trim().toLowerCase();
+    if (mediaType !== requiredType) continue;
+
+    let quality = 1;
+    let qualitySeen = false;
+    let valid = true;
+    for (const parameter of parameters) {
+      const separator = parameter.indexOf("=");
+      if (separator < 0 || parameter.slice(0, separator).trim().toLowerCase() !== "q") continue;
+      if (qualitySeen) {
+        valid = false;
+        break;
+      }
+      qualitySeen = true;
+      const rawQuality = parameter.slice(separator + 1).trim();
+      if (!/^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(rawQuality)) {
+        valid = false;
+        break;
+      }
+      quality = Number(rawQuality);
+    }
+    if (valid && quality > 0) return true;
+  }
+  return false;
+}
+
+function validMcpAccept(request) {
+  const accept = request.headers.get("accept");
+  return typeof accept === "string" &&
+    mediaRangeIsAccepted(accept, "application/json") &&
+    mediaRangeIsAccepted(accept, "text/event-stream");
+}
+
 function failure(status, code) {
   return new Response(JSON.stringify({ error: code }), {
     status,
@@ -106,17 +149,36 @@ function failure(status, code) {
   });
 }
 
+function normalizeLegacyInitializeRequest(request, payload) {
+  const message = Array.isArray(payload) ? payload[0] : payload;
+  const normalizedMessage = {
+    ...message,
+    params: { ...message.params, protocolVersion: MCP_PROTOCOL_VERSION },
+  };
+  const normalizedPayload = Array.isArray(payload) ? [normalizedMessage] : normalizedMessage;
+  const headers = new Headers(request.headers);
+  // The body is reserialized as plain JSON; do not carry representation framing headers over.
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  headers.delete("transfer-encoding");
+  return new Request(request.url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(normalizedPayload),
+  });
+}
+
 async function validateProtocol(request) {
   let payload;
   try {
     payload = await request.clone().json();
   } catch {
-    return failure(400, "invalid_mcp_request");
+    return { error: failure(400, "invalid_mcp_request"), request };
   }
 
   const messages = Array.isArray(payload) ? payload : [payload];
   if (messages.length === 0 || messages.some((message) => !message || typeof message !== "object")) {
-    return failure(400, "invalid_mcp_request");
+    return { error: failure(400, "invalid_mcp_request"), request };
   }
 
   const initializeMessages = messages.filter((message) => message.method === "initialize");
@@ -124,25 +186,30 @@ async function validateProtocol(request) {
 
   if (initializeMessages.length > 0) {
     if (messages.length !== 1 || initializeMessages.length !== 1) {
-      return failure(400, "invalid_mcp_request");
+      return { error: failure(400, "invalid_mcp_request"), request };
     }
-    if (initializeMessages[0].params?.protocolVersion !== MCP_PROTOCOL_VERSION) {
-      return failure(400, "unsupported_protocol_version");
+    const requestedVersion = initializeMessages[0].params?.protocolVersion;
+    if (requestedVersion !== MCP_PROTOCOL_VERSION && requestedVersion !== LEGACY_PROTOCOL_VERSION) {
+      return { error: failure(400, "unsupported_protocol_version"), request };
     }
-    // Initialization has not negotiated a version yet; if the header is present,
-    // it must still agree with the only version this endpoint supports.
+    // The version header is for requests after initialization. If a client supplies
+    // it anyway, accept only the implementation's actual version, never an echoable value.
     if (headerVersion !== null && headerVersion !== MCP_PROTOCOL_VERSION) {
-      return failure(400, "unsupported_protocol_version");
+      return { error: failure(400, "unsupported_protocol_version"), request };
     }
-    return null;
+
+    const normalizedRequest = requestedVersion === LEGACY_PROTOCOL_VERSION
+      ? normalizeLegacyInitializeRequest(request, payload)
+      : request;
+    return { error: null, request: normalizedRequest };
   }
 
-  // This server is stateless, so require the agreed version on every non-initialize
-  // request/notification, including notifications/initialized.
-  if (headerVersion !== MCP_PROTOCOL_VERSION) {
-    return failure(400, "unsupported_protocol_version");
+  // The endpoint is stateless and cannot recover an older session's negotiated version.
+  // Per the 2025-11-25 HTTP fallback, an absent header therefore means 2025-03-26.
+  if (headerVersion !== null && headerVersion !== MCP_PROTOCOL_VERSION) {
+    return { error: failure(400, "unsupported_protocol_version"), request };
   }
-  return null;
+  return { error: null, request };
 }
 
 function responseContainsSecret(value, secret) {
@@ -195,11 +262,14 @@ export async function withVerifiedProject(request, { connect, invoke }) {
     });
   }
 
+  if (!validJsonContentType(request)) return failure(415, "unsupported_media_type");
+  if (!validMcpAccept(request)) return failure(406, "not_acceptable");
+
   const apiKey = parseBearerHeader(request.headers.get("authorization"));
   if (!apiKey) return failure(401, "unauthorized");
 
-  const protocolError = await validateProtocol(request);
-  if (protocolError) return protocolError;
+  const protocol = await validateProtocol(request);
+  if (protocol.error) return protocol.error;
 
   let client;
   try {
@@ -207,7 +277,7 @@ export async function withVerifiedProject(request, { connect, invoke }) {
     const info = await client.getProjectInfo();
     if (info?.id !== route.projectId) return failure(403, "project_key_mismatch");
 
-    const response = await invoke({ request, route, client });
+    const response = await invoke({ request: protocol.request, route, client });
     return await redactResponse(response, apiKey);
   } catch {
     // SDK and transport errors are intentionally suppressed; they may contain credentials.
