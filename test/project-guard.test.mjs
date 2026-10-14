@@ -10,6 +10,7 @@ import {
   withVerifiedProject,
 } from "../src/project-guard.mjs";
 import { createWorkerHandler } from "../src/worker.mjs";
+import { FRAMER_SDK_METHODS } from "../src/framer-api-methods.mjs";
 
 const projectId = "DemoProject2026";
 const sdkProjectId = "54e00f7d5c47d81e20ed1e5ebe223d2644c9cf4cc62165f5b5f47a0ffd17745b";
@@ -297,7 +298,7 @@ test("the installed Cloudflare MCP handler enforces its configured exact path", 
   assert.equal((await responseJson(exactPath)).result.serverInfo.name, "route-test");
 });
 
-test("initialize supports all official MCP versions (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05)", async () => {
+test("initialize, tools/list, and safe reads work with the exact live-base protocol", async () => {
   const lifecycle = [];
   const worker = createWorkerHandler({
     connectClient: async (url, key) => {
@@ -325,57 +326,54 @@ test("initialize supports all official MCP versions (2025-11-25, 2025-06-18, 202
   assert.equal(await initialized.text(), "");
 
   const list = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
     message: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
   }), {}, ctx);
   assert.equal(list.status, 200);
   const tools = (await responseJson(list)).result.tools;
   const names = tools.map((tool) => tool.name);
-  assert.ok(names.includes("framer_get_project_info"));
-  assert.ok(names.includes("framer_upsert_cms_items"));
-  assert.ok(names.includes("framer_delete_cms_items"));
-  assert.ok(names.includes("framer_publish_preview"));
-  assert.ok(names.includes("framer_deploy_published_version"));
-
-  const gatedNames = ["framer_upsert_cms_items", "framer_delete_cms_items", "framer_publish_preview", "framer_deploy_published_version"];
-  for (const name of gatedNames) {
-    const schema = tools.find((tool) => tool.name === name)?.inputSchema;
-    assert.ok(schema?.properties?.confirm, `${name} schema must expose confirm`);
-    assert.ok(schema.required?.includes("confirm"), `${name} must require confirm`);
+  assert.equal(tools.length, FRAMER_SDK_METHODS.length);
+  assert.equal(tools.length, 269);
+  for (const name of [
+    "framer_get_project_info", "framer_get_collections", "framer_collection_add_items",
+    "framer_collection_item_remove", "framer_publish", "framer_deploy",
+    "framer_agent_apply_changes", "framer_screenshot", "framer_export_svg",
+  ]) assert.ok(names.includes(name), `${name} must be listed`);
+  for (const tool of tools) {
+    assert.equal(Object.hasOwn(tool.inputSchema.properties ?? {}, "confirm"), false, `${tool.name} must not add an MCP confirmation argument`);
   }
 
-  const call = await worker.fetch(rpcRequest({
+  const info = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
     message: { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "framer_get_project_info", arguments: {} } },
   }), {}, ctx);
-  assert.equal(call.status, 200);
-  const result = (await responseJson(call)).result;
-  assert.notEqual(result.isError, true);
-  assert.match(result.content[0].text, /Test project/);
+  assert.equal(info.status, 200);
+  const infoResult = (await responseJson(info)).result;
+  assert.notEqual(infoResult.isError, true);
+  assert.match(infoResult.content[0].text, /Test project/);
 
+  const cmsRead = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "framer_collection_get_items", arguments: { collectionId: "collection-1" } } },
+  }), {}, ctx);
+  assert.equal(cmsRead.status, 200);
+  const cmsResult = (await responseJson(cmsRead)).result;
+  assert.notEqual(cmsResult.isError, true);
+  assert.match(cmsResult.content[0].text, /Hello/);
   assert.equal(lifecycle.some((entry) => ["addItems", "removeItems", "publish", "deploy"].includes(entry)), false);
 });
 
-test("dangerous tools reject missing or false confirmation without invoking any Framer write or release method", async () => {
+test("write, delete, publish, and deploy tools are exposed without invoking them in tests", async () => {
   const actions = [];
   const worker = createWorkerHandler({ connectClient: async () => stubClient(sdkProjectId, actions) });
-  const ctx = { waitUntil() {} };
-  const cases = [
-    ["framer_upsert_cms_items", { collectionId: "collection-1", items: [{ slug: "new-item" }] }],
-    ["framer_delete_cms_items", { collectionId: "collection-1", itemIds: ["item-1"] }],
-    ["framer_publish_preview", {}],
-    ["framer_deploy_published_version", { deploymentId: "deployment-1" }],
-  ];
-
-  for (const [name, args] of cases) {
-    for (const withFalse of [false, true]) {
-      const rejectedArgs = withFalse ? { ...args, confirm: false } : args;
-      const response = await worker.fetch(rpcRequest({
-        protocolHeader: MCP_PROTOCOL_VERSION,
-        message: { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name, arguments: rejectedArgs } },
-      }), {}, ctx);
-      assert.equal(response.status, 200);
-      const reply = await responseJson(response);
-      assert.ok(reply.error || reply.result?.isError === true, `${name} without confirm:true must fail`);
-    }
+  const response = await worker.fetch(rpcRequest({
+    protocolHeader: MCP_PROTOCOL_VERSION,
+    message: { jsonrpc: "2.0", id: 10, method: "tools/list", params: {} },
+  }), {}, { waitUntil() {} });
+  assert.equal(response.status, 200);
+  const names = (await responseJson(response)).result.tools.map((tool) => tool.name);
+  for (const name of ["framer_collection_add_items", "framer_collection_item_remove", "framer_publish", "framer_deploy", "framer_agent_apply_changes"]) {
+    assert.ok(names.includes(name), `${name} must be directly exposed`);
   }
   assert.equal(actions.some((entry) => ["addItems", "removeItems", "publish", "deploy"].includes(entry)), false);
 });
