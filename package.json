@@ -1,0 +1,11 @@
+{
+  "name": "framer-server-api-mcp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
