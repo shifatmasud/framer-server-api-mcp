@@ -12,10 +12,12 @@ import {
 import { createWorkerHandler } from "../src/worker.mjs";
 import { FRAMER_SDK_METHODS } from "../src/framer-api-methods.mjs";
 
+const projectSlug = "Sample-Site";
 const projectId = "DemoProject2026";
 const sdkProjectId = "54e00f7d5c47d81e20ed1e5ebe223d2644c9cf4cc62165f5b5f47a0ffd17745b";
-const routePath = `/mcp/projects/Sample-Site--${projectId}`;
-const projectUrl = `https://framer.com/projects/Sample-Site--${projectId}`;
+const routePath = `/mcp/projects/${projectSlug}--${projectId}`;
+const projectUrl = `https://framer.com/projects/${projectSlug}--${projectId}`;
+const testHost = "framer-server-api-mcp.shifatmasud.workers.dev";
 const testKey = "unit-test-key-42";
 const initializeMessage = {
   jsonrpc: "2.0",
@@ -31,7 +33,7 @@ const initializeMessage = {
 function rpcRequest({
   path = routePath,
   authorization = `Bearer ${testKey}`,
-  host = "framer-server-api-mcp.shifatmasud.workers.dev",
+  host = testHost,
   origin = null,
   protocolHeader = null,
   method = "POST",
@@ -47,7 +49,7 @@ function rpcRequest({
   if (origin !== null) headers.set("origin", origin);
   if (protocolHeader !== null) headers.set("mcp-protocol-version", protocolHeader);
 
-  return new Request(`https://framer-server-api-mcp.shifatmasud.workers.dev${path}`, {
+  return new Request(`https://${testHost}${path}`, {
     method,
     headers,
     body: method === "POST" ? JSON.stringify(message) : undefined,
@@ -91,7 +93,7 @@ function stubClient(id, calls = []) {
 }
 
 test("project route accepts one canonical slug--id path and rejects malformed or unknown selectors", async (t) => {
-  const parsed = parsePinnedProjectRoute(`https://framer-server-api-mcp.shifatmasud.workers.dev${routePath}`);
+  const parsed = parsePinnedProjectRoute(`https://example.test${routePath}`);
   assert.equal(parsed?.projectId, projectId);
   assert.equal(parsed?.projectUrl, projectUrl);
   assert.equal(parsed?.pathname, routePath);
@@ -100,11 +102,11 @@ test("project route accepts one canonical slug--id path and rejects malformed or
     "/mcp/projects/not-a-project",
     `${routePath}/extra`,
     `${routePath}?projectId=other`,
-    `/mcp/projects/Sample-Site--short`,
-    `/mcp/projects/Sample-Site--${projectId}%2Fother`,
-    "/mcp/projects/../other--DemoProject2026",
+    `/mcp/projects/${projectSlug}--short`,
+    `/mcp/projects/${projectSlug}--${projectId}%2Fother`,
+    "/mcp/projects/../other--UnrelatedProject999",
   ]) {
-    await t.test(path, () => assert.equal(parsePinnedProjectRoute(`https://framer-server-api-mcp.shifatmasud.workers.dev${path}`), null));
+    await t.test(path, () => assert.equal(parsePinnedProjectRoute(`https://example.test${path}`), null));
   }
 });
 
@@ -113,7 +115,7 @@ test("invalid, missing, or mismatched Host and any unverified present Origin fai
   const worker = createWorkerHandler({ connectClient: async () => { sdkCalls++; return stubClient(sdkProjectId); } });
   const ctx = { waitUntil() {} };
 
-  for (const host of [null, "attacker.example", "framer-server-api-mcp.shifatmasud.workers.dev/extra", "bad host"]) {
+  for (const host of [null, "attacker.example", `${testHost}/extra`, "bad host"]) {
     const response = await worker.fetch(rpcRequest({ host }), {}, ctx);
     assert.equal(response.status, 400, `host ${String(host)} must be rejected`);
   }
@@ -286,7 +288,7 @@ test("the installed Cloudflare MCP handler enforces its configured exact path", 
   const handler = createMcpHandler(() => {
     serverCreated++;
     return new McpServer({ name: "route-test", version: "1.0.0" });
-  }, { route: routePath, responseMode: "auto", allowedHostnames: ["framer-server-api-mcp.shifatmasud.workers.dev"] });
+  }, { route: routePath, responseMode: "auto", allowedHostnames: [testHost] });
 
   const wrongPath = await handler(rpcRequest({ path: `${routePath}/other` }), {}, { waitUntil() {} });
   assert.equal(wrongPath.status, 404);
